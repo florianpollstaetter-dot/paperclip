@@ -1,0 +1,4 @@
+# Allow the paperclip service account to restart the Paperclip harness
+# unattended (ORA-2743). Mirrors the existing mc-disk-cleanup / mc-db-compact
+# grants. Install to /etc/sudoers.d/mc-restart-paperclip as root:root mode 0440.
+paperclip ALL=(root) NOPASSWD: /usr/local/bin/mc-restart-paperclip
