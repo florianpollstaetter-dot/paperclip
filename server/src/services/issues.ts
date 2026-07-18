@@ -462,6 +462,14 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+// ORA-2743: execution-path statuses that hold an issue's executionRunId while
+// awaiting (re)dispatch but are not currently running. A stale scheduled_retry
+// left behind by a process_lost / rate-limit cascade is neither terminal (so
+// the lock-clearing sweeps skip it) nor running (so the process-loss watchdog
+// never re-finalizes it), which permanently 409s the same agent's own live
+// heartbeat out of checking out / patching / releasing its own issue. A live
+// run of the *same* agent is allowed to supersede such a pending run.
+export const SUPERSEDABLE_PENDING_HEARTBEAT_RUN_STATUSES = new Set(["scheduled_retry"]);
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -4258,6 +4266,125 @@ export function issueService(db: Db) {
     });
   }
 
+  // ORA-2743: adopt an issue's execution lock away from a stuck same-agent
+  // scheduled_retry run so the agent's own live run can proceed. Cancels the
+  // superseded pending run (and its wakeup request) inside the same
+  // transaction so promoteDueScheduledRetries cannot resurrect a duplicate
+  // dispatch after the lock is adopted. Re-verifies every precondition under a
+  // row lock; a no-op returns { adopted: null }.
+  async function adoptSupersededPendingExecutionRun(input: {
+    issueId: string;
+    actorAgentId: string;
+    actorRunId: string;
+    expectedExecutionRunId: string;
+    expectedStatuses: readonly string[];
+  }): Promise<{ adopted: typeof issues.$inferSelect | null; supersededRunId: string | null }> {
+    return db.transaction(async (tx) => {
+      const issue = await tx
+        .select({
+          id: issues.id,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!issue) return { adopted: null, supersededRunId: null };
+      if (issue.executionRunId !== input.expectedExecutionRunId) {
+        return { adopted: null, supersededRunId: null };
+      }
+      if (!(issue.assigneeAgentId === input.actorAgentId || issue.assigneeAgentId == null)) {
+        return { adopted: null, supersededRunId: null };
+      }
+      if (!input.expectedStatuses.includes(issue.status)) {
+        return { adopted: null, supersededRunId: null };
+      }
+
+      const [priorRun, actorRun] = await Promise.all([
+        tx
+          .select({
+            id: heartbeatRuns.id,
+            status: heartbeatRuns.status,
+            agentId: heartbeatRuns.agentId,
+            wakeupRequestId: heartbeatRuns.wakeupRequestId,
+          })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, input.expectedExecutionRunId))
+          .for("update")
+          .then((rows) => rows[0] ?? null),
+        tx
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, input.actorRunId))
+          .then((rows) => rows[0] ?? null),
+      ]);
+
+      // The prior lock holder must be a supersedable pending run owned by the
+      // same agent; the actor run must itself still be live.
+      if (
+        !priorRun ||
+        priorRun.agentId !== input.actorAgentId ||
+        !SUPERSEDABLE_PENDING_HEARTBEAT_RUN_STATUSES.has(priorRun.status)
+      ) {
+        return { adopted: null, supersededRunId: null };
+      }
+      if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status)) {
+        return { adopted: null, supersededRunId: null };
+      }
+
+      const now = new Date();
+      const supersedeReason = `Superseded by live run ${input.actorRunId} adopting the issue execution lock`;
+      const supersededRun = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "cancelled",
+          finishedAt: now,
+          error: supersedeReason,
+          errorCode: "superseded_by_live_execution",
+          scheduledRetryAt: null,
+          updatedAt: now,
+        })
+        .where(and(eq(heartbeatRuns.id, priorRun.id), eq(heartbeatRuns.status, priorRun.status)))
+        .returning({ id: heartbeatRuns.id })
+        .then((rows) => rows[0] ?? null);
+      if (!supersededRun) return { adopted: null, supersededRunId: null };
+
+      if (priorRun.wakeupRequestId) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: supersedeReason,
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, priorRun.wakeupRequestId));
+      }
+
+      const adoptionSet: Record<string, unknown> = {
+        assigneeAgentId: input.actorAgentId,
+        checkoutRunId: input.actorRunId,
+        executionRunId: input.actorRunId,
+        executionAgentNameKey: null,
+        executionLockedAt: now,
+        status: "in_progress",
+        updatedAt: now,
+      };
+      if (issue.status !== "in_progress") adoptionSet.startedAt = now;
+
+      const adopted = await tx
+        .update(issues)
+        .set(adoptionSet)
+        .where(and(eq(issues.id, input.issueId), eq(issues.executionRunId, input.expectedExecutionRunId)))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      return { adopted, supersededRunId: adopted ? priorRun.id : null };
+    });
+  }
+
   async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
@@ -5985,6 +6112,27 @@ export function issueService(db: Db) {
         }
       }
 
+      // ORA-2743: adopt away from a stuck same-agent scheduled_retry lock.
+      if (
+        checkoutRunId &&
+        current.executionRunId &&
+        current.executionRunId !== checkoutRunId &&
+        current.checkoutRunId == null &&
+        (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
+      ) {
+        const superseded = await adoptSupersededPendingExecutionRun({
+          issueId: id,
+          actorAgentId: agentId,
+          actorRunId: checkoutRunId,
+          expectedExecutionRunId: current.executionRunId,
+          expectedStatuses,
+        });
+        if (superseded.adopted) {
+          const [enriched] = await withIssueLabels(db, [superseded.adopted]);
+          return enriched;
+        }
+      }
+
       // If this run already owns it and it's in_progress, return it (no self-409)
       if (
         current.assigneeAgentId === agentId &&
@@ -6114,6 +6262,38 @@ export function issueService(db: Db) {
             const latestOwnership = resolveSameRunOwnership(staleAdoption.latest);
             if (latestOwnership) return { ownership: latestOwnership, latest: staleAdoption.latest };
             return { ownership: null, latest: staleAdoption.latest };
+          }
+        }
+
+        // ORA-2743: a live run may take over the execution lock from a stuck
+        // same-agent scheduled_retry run (checkoutRunId already cleared above).
+        if (
+          actorRunId &&
+          candidate.status === "in_progress" &&
+          candidate.assigneeAgentId === actorAgentId &&
+          candidate.checkoutRunId == null &&
+          candidate.executionRunId &&
+          candidate.executionRunId !== actorRunId
+        ) {
+          const superseded = await adoptSupersededPendingExecutionRun({
+            issueId: id,
+            actorAgentId,
+            actorRunId,
+            expectedExecutionRunId: candidate.executionRunId,
+            expectedStatuses: ["in_progress"],
+          });
+          if (superseded.adopted) {
+            return {
+              ownership: {
+                id: superseded.adopted.id,
+                status: superseded.adopted.status,
+                assigneeAgentId: superseded.adopted.assigneeAgentId,
+                checkoutRunId: superseded.adopted.checkoutRunId,
+                executionRunId: superseded.adopted.executionRunId,
+                adoptedFromRunId: superseded.supersededRunId,
+              },
+              latest: null,
+            };
           }
         }
 

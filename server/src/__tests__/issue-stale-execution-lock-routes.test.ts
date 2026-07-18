@@ -421,4 +421,115 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionRunId: currentRunId,
     });
   });
+
+  it("lets the assignee PATCH by superseding its own stuck scheduled_retry execution lock (ORA-2743)", async () => {
+    // A process_lost / rate-limit cascade leaves the issue's executionRunId
+    // pinned to a scheduled_retry run of the same agent. That run is neither
+    // terminal (sweeps skip it) nor running (the watchdog never re-finalizes
+    // it), so the agent's own live heartbeat used to 409 forever.
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const scheduledRetryRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: scheduledRetryRunId,
+      companyId,
+      agentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      scheduledRetryAt: new Date(Date.now() + 60_000),
+      scheduledRetryAttempt: 4,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Stuck scheduled_retry lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: scheduledRetryRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Superseded scheduled_retry lock" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.title).toBe("Superseded scheduled_retry lock");
+
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ checkoutRunId: currentRunId, executionRunId: currentRunId });
+
+    // The superseded pending run is cancelled so promoteDueScheduledRetries
+    // cannot resurrect a duplicate dispatch after the lock is adopted.
+    const supersededRun = await db
+      .select({ status: heartbeatRuns.status, scheduledRetryAt: heartbeatRuns.scheduledRetryAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduledRetryRunId))
+      .then((rows) => rows[0]);
+    expect(supersededRun?.status).toBe("cancelled");
+    expect(supersededRun?.scheduledRetryAt).toBeNull();
+  });
+
+  it("does not supersede a scheduled_retry execution lock owned by a different agent", async () => {
+    // Guard: only the *same* agent's live run may supersede the pending run.
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const otherAgentId = randomUUID();
+    const otherAgentRetryRunId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "OtherAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: otherAgentRetryRunId,
+      companyId,
+      agentId: otherAgentId,
+      status: "scheduled_retry",
+      invocationSource: "automation",
+      scheduledRetryAt: new Date(Date.now() + 60_000),
+      scheduledRetryAttempt: 1,
+    });
+    // Issue is assigned to `agentId` but its execution lock points at another
+    // agent's pending retry — a corrupt shape that must not be silently stolen.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Cross-agent scheduled_retry lock",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: null,
+      executionRunId: otherAgentRetryRunId,
+      executionAgentNameKey: "otheragent",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Should not steal" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body?.error).toBe("Issue run ownership conflict");
+
+    const otherRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, otherAgentRetryRunId))
+      .then((rows) => rows[0]);
+    expect(otherRun?.status).toBe("scheduled_retry");
+  });
 });
