@@ -1,0 +1,20 @@
+#!/bin/bash
+# Paperclip harness service restart wrapper (ORA-2743).
+#
+# Installed to /usr/local/bin/mc-restart-paperclip and granted a single
+# NOPASSWD sudoers entry so an agent heartbeat can complete the
+# merge -> deploy -> verify sequence unattended. Follows the same shape as
+# the existing /usr/local/bin/mc-disk-cleanup and mc-db-compact wrappers:
+# one fixed privileged action, no user-controlled arguments.
+set -euo pipefail
+
+# This wrapper performs exactly one action and accepts no arguments. Refusing
+# args keeps the sudoers grant narrow: it can only ever restart the service,
+# never be coaxed into running systemctl against a different unit.
+if [ "$#" -ne 0 ]; then
+  echo "mc-restart-paperclip: takes no arguments" >&2
+  exit 64
+fi
+
+# exec so systemctl's exit code passes straight through to the caller.
+exec /usr/bin/systemctl restart paperclip.service
