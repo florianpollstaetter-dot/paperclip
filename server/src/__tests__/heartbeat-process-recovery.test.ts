@@ -36,6 +36,8 @@ import {
   issues,
   projects,
   projectWorkspaces,
+  routines,
+  routineTriggers,
   workspaceOperations,
 } from "@paperclipai/db";
 import {
@@ -767,6 +769,39 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
 
     return { companyId, agentId, runId, wakeupRequestId, issueId, rootIssueId };
+  }
+
+  async function seedScheduleRoutineForIssue(input: {
+    companyId: string;
+    agentId: string;
+    parentIssueId: string;
+    routineStatus?: string;
+    triggerEnabled?: boolean;
+    triggerKind?: string;
+    nextRunAt?: Date | null;
+  }) {
+    const routineId = randomUUID();
+    await db.insert(routines).values({
+      id: routineId,
+      companyId: input.companyId,
+      parentIssueId: input.parentIssueId,
+      title: "Watcher routine",
+      assigneeAgentId: input.agentId,
+      status: input.routineStatus ?? "active",
+    });
+    await db.insert(routineTriggers).values({
+      id: randomUUID(),
+      companyId: input.companyId,
+      routineId,
+      kind: input.triggerKind ?? "schedule",
+      enabled: input.triggerEnabled ?? true,
+      cronExpression: "7 6 * * *",
+      timezone: "UTC",
+      nextRunAt: input.nextRunAt === undefined
+        ? new Date(Date.now() + 60 * 60 * 1000)
+        : input.nextRunAt,
+    });
+    return { routineId };
   }
 
   async function seedInReviewParticipantRunFixture(input?: {
@@ -3959,6 +3994,63 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     if (retryRun) {
       await waitForRunToSettle(heartbeat, retryRun.id);
+    }
+  });
+
+  it("suppresses the continuation wake when an active schedule routine already covers the issue", async () => {
+    // KIN-5945: productive-but-stranded continuation that would normally requeue,
+    // but the issue is the parent of an active cron routine with a future
+    // next_run_at, so the cron owns the next run and no wake should be fired.
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    await seedScheduleRoutineForIssue({ companyId, agentId, parentIssueId: issueId });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.find((row) => row.id !== runId)).toBeUndefined();
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+  });
+
+  it("still requeues the continuation when the schedule routine is not an active future cron", async () => {
+    // KIN-5945 negative cases: past next_run_at, disabled trigger, non-active
+    // routine, and non-schedule kind must all fall through to normal behaviour.
+    for (const override of [
+      { nextRunAt: new Date(Date.now() - 60 * 60 * 1000) },
+      { triggerEnabled: false },
+      { routineStatus: "paused" },
+      { triggerKind: "webhook" as const },
+    ]) {
+      const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        livenessState: "advanced",
+      });
+      await seedScheduleRoutineForIssue({ companyId, agentId, parentIssueId: issueId, ...override });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(1);
+      expect(result.issueIds).toContain(issueId);
+
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const retryRun = runs.find((row) => row.id !== runId);
+      expect(retryRun?.contextSnapshot as Record<string, unknown> | undefined).toMatchObject({
+        issueId,
+        retryReason: "issue_continuation_needed",
+      });
+      if (retryRun) {
+        await waitForRunToSettle(heartbeat, retryRun.id);
+      }
     }
   });
 
