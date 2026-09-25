@@ -23,6 +23,8 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  routines,
+  routineTriggers,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -689,6 +691,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           eq(agentWakeupRequests.status, "queued"),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
           agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
+  // KIN-5945: true if the issue is the parent of an active routine whose
+  // schedule trigger has a future next_run_at. In that case a cron already owns
+  // the next continuation, so the stranded-recovery loop must not fire its own
+  // issue_continuation_needed wake (which would double up and, after repeated
+  // idle retries, falsely escalate the issue to blocked).
+  async function issueHasActiveScheduledContinuation(companyId: string, issueId: string) {
+    return db
+      .select({ id: routineTriggers.id })
+      .from(routineTriggers)
+      .innerJoin(routines, eq(routineTriggers.routineId, routines.id))
+      .where(
+        and(
+          eq(routines.companyId, companyId),
+          eq(routines.parentIssueId, issueId),
+          eq(routines.status, "active"),
+          eq(routineTriggers.enabled, true),
+          eq(routineTriggers.kind, "schedule"),
+          gt(routineTriggers.nextRunAt, new Date()),
         ),
       )
       .limit(1)
@@ -3101,6 +3127,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (!latestRun && !issue.checkoutRunId && !issue.executionRunId) {
+        result.skipped += 1;
+        continue;
+      }
+      // KIN-5945: when an active cron routine already schedules this issue's next
+      // continuation, let the cron own it instead of firing a redundant
+      // issue_continuation_needed wake here. This suppresses both continuation
+      // enqueue sites below and the false blocked-escalation after idle retries.
+      if (await issueHasActiveScheduledContinuation(issue.companyId, issue.id)) {
         result.skipped += 1;
         continue;
       }
