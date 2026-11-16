@@ -142,6 +142,7 @@ import {
   shouldPreserveComposerViewport,
 } from "../lib/issue-chat-scroll";
 import { formatAssigneeUserLabel } from "../lib/assignees";
+import { keepThreadScrollAnchored } from "../lib/thread-scroll-anchor";
 import type { CompanyUserProfile } from "../lib/company-members";
 import { timeAgo } from "../lib/timeAgo";
 import {
@@ -3412,6 +3413,14 @@ interface IssueChatThreadScrollKeeperProps {
 // the only React hook that still sees the pre-mutation layout, hence a class.
 class IssueChatThreadScrollKeeper extends Component<IssueChatThreadScrollKeeperProps> {
   private containerRef = createRef<HTMLDivElement>();
+  private releaseGuard: (() => void) | null = null;
+
+  componentDidMount() {
+    // Late layout shifts between commits (header/description arriving, rows
+    // measuring, images loading) are compensated the same way browsers with
+    // scroll anchoring do it natively.
+    this.releaseGuard = keepThreadScrollAnchored(this.containerRef.current);
+  }
 
   getSnapshotBeforeUpdate(prevProps: IssueChatThreadScrollKeeperProps): ThreadScrollAnchorSnapshot | null {
     if (prevProps.messages === this.props.messages || typeof window === "undefined") return null;
@@ -3440,6 +3449,8 @@ class IssueChatThreadScrollKeeper extends Component<IssueChatThreadScrollKeeperP
 
   componentWillUnmount() {
     this.props.handoffAnchorRef.current = null;
+    this.releaseGuard?.();
+    this.releaseGuard = null;
   }
 
   render() {

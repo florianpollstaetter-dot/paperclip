@@ -80,3 +80,92 @@ describe("thread-scroll-anchor", () => {
     scroller.remove();
   });
 });
+
+describe("keepThreadScrollAnchored", () => {
+  function setScrollY(value: number) {
+    Object.defineProperty(window, "scrollY", { value, configurable: true, writable: true });
+  }
+  function installResizeObserver() {
+    const callbacks: Array<() => void> = [];
+    class FakeResizeObserver {
+      constructor(cb: () => void) { callbacks.push(cb); }
+      observe() {}
+      disconnect() { callbacks.length = 0; }
+    }
+    (globalThis as { ResizeObserver?: unknown }).ResizeObserver = FakeResizeObserver;
+    return { fire: () => callbacks.slice().forEach((cb) => cb()), uninstall: () => { delete (globalThis as { ResizeObserver?: unknown }).ResizeObserver; } };
+  }
+
+  it("scrolls the row at the top of the viewport back into place when content above grows", async () => {
+    const { keepThreadScrollAnchored } = await import("./thread-scroll-anchor");
+    const ro = installResizeObserver();
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    buildRows(container, [{ id: "a", top: -900 }, { id: "b", top: 40 }, { id: "c", top: 400 }]);
+    const b = container.querySelector(`[${THREAD_SCROLL_ANCHOR_ATTR}="b"]`) as HTMLElement;
+    const scrollBy = vi.spyOn(window, "scrollBy").mockImplementation(() => {});
+
+    const release = keepThreadScrollAnchored(container);
+    mockRect(b, 540); // the header above the rows rendered late, 500px tall
+    ro.fire();
+    expect(scrollBy).toHaveBeenLastCalledWith({ top: 500, left: 0, behavior: "auto" });
+    ro.fire(); // nothing moved since the last record
+    expect(scrollBy).toHaveBeenCalledTimes(1);
+
+    // The reader scrolls on by 640px: the row now at the top becomes the anchor.
+    setScrollY(640);
+    mockRect(b, -600);
+    const c = container.querySelector(`[${THREAD_SCROLL_ANCHOR_ATTR}="c"]`) as HTMLElement;
+    mockRect(c, 20);
+    window.dispatchEvent(new Event("scroll"));
+    expect(scrollBy).toHaveBeenCalledTimes(1);
+    mockRect(c, 320);
+    ro.fire();
+    expect(scrollBy).toHaveBeenLastCalledWith({ top: 300, left: 0, behavior: "auto" });
+
+    release();
+    mockRect(c, 900);
+    ro.fire();
+    expect(scrollBy).toHaveBeenCalledTimes(2);
+    scrollBy.mockRestore();
+    setScrollY(0);
+    ro.uninstall();
+    container.remove();
+  });
+
+  it("compensates a shift that lands before the next scroll event instead of absorbing it", async () => {
+    const { keepThreadScrollAnchored } = await import("./thread-scroll-anchor");
+    const ro = installResizeObserver();
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    buildRows(container, [{ id: "a", top: -900 }, { id: "b", top: 40 }]);
+    const b = container.querySelector(`[${THREAD_SCROLL_ANCHOR_ATTR}="b"]`) as HTMLElement;
+    const scrollBy = vi.spyOn(window, "scrollBy").mockImplementation(() => {});
+    const release = keepThreadScrollAnchored(container);
+
+    // Rows above re-measure while no scrolling happened: the scroll event
+    // (or the idle timer) runs before the resize callback and must not take
+    // the displaced position as the new anchor.
+    mockRect(b, 136);
+    window.dispatchEvent(new Event("scroll"));
+    expect(scrollBy).toHaveBeenLastCalledWith({ top: 96, left: 0, behavior: "auto" });
+    ro.fire();
+    expect(scrollBy).toHaveBeenCalledTimes(1);
+
+    release();
+    scrollBy.mockRestore();
+    ro.uninstall();
+    container.remove();
+  });
+
+  it("is a no-op without ResizeObserver support", async () => {
+    const { keepThreadScrollAnchored } = await import("./thread-scroll-anchor");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    buildRows(container, [{ id: "b", top: 40 }]);
+    const release = keepThreadScrollAnchored(container);
+    expect(typeof release).toBe("function");
+    release();
+    container.remove();
+  });
+});
