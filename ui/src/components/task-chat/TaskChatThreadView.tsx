@@ -13,6 +13,8 @@ import { TaskChatToolCard } from "./TaskChatToolCard";
 import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
 import { TaskChatActivityPhase } from "./TaskChatActivityPhase";
 import { TaskMessageScroller } from "./TaskMessageScroller";
+import { TaskChatScrollAnchorKeeper } from "./TaskChatScrollAnchorKeeper";
+import { THREAD_SCROLL_ANCHOR_ATTR } from "@/lib/thread-scroll-anchor";
 
 interface TaskChatThreadViewProps {
   items: TaskChatItem[];
@@ -152,18 +154,20 @@ export function TaskChatThreadView({
           {header}
         </div>
       ) : null}
-      {items.map((item) => (
-        <div key={item.id}>
-          {renderItem(
-            item,
-            onApprovalDecision,
-            renderInteraction,
-            renderBrief,
-            renderMessageActions,
-            renderQueuedAction,
-          )}
-        </div>
-      ))}
+      <TaskChatScrollAnchorKeeper itemsKey={items} className="flex flex-col gap-5">
+        {items.map((item) => (
+          <div key={item.id} {...{ [THREAD_SCROLL_ANCHOR_ATTR]: item.id }}>
+            {renderItem(
+              item,
+              onApprovalDecision,
+              renderInteraction,
+              renderBrief,
+              renderMessageActions,
+              renderQueuedAction,
+            )}
+          </div>
+        ))}
+      </TaskChatScrollAnchorKeeper>
       {tail}
     </div>
   );

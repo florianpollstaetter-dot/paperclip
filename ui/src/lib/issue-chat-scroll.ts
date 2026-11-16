@@ -102,3 +102,67 @@ export function restoreComposerViewportSnapshot(
 
   win.scrollBy({ top: delta, left: 0, behavior: "auto" });
 }
+
+export interface ThreadScrollAnchorSnapshot {
+  anchorId: string;
+  viewportTop: number;
+}
+
+/**
+ * Pick the thread row the reader is currently looking at: the first anchored
+ * row (in document order) whose bottom edge has not scrolled above the
+ * viewport. Rows are identified by the `id={anchorId}` they already render, so
+ * the same element can be found again after React commits a new message list.
+ *
+ * Call this *before* the DOM changes (e.g. from `getSnapshotBeforeUpdate`).
+ */
+export function captureThreadScrollAnchor(
+  container: HTMLElement | null,
+  anchorIds: ReadonlySet<string>,
+): ThreadScrollAnchorSnapshot | null {
+  if (!container || anchorIds.size === 0) return null;
+  const candidates = container.querySelectorAll<HTMLElement>("[id]");
+  for (const element of candidates) {
+    if (!anchorIds.has(element.id)) continue;
+    const rect = element.getBoundingClientRect();
+    if (rect.height <= 0) continue;
+    if (rect.bottom >= 0) {
+      return { anchorId: element.id, viewportTop: rect.top };
+    }
+  }
+  return null;
+}
+
+/**
+ * After the DOM changed, scroll by however far the anchored row moved so the
+ * reader keeps seeing the same content. Older comment pages are prepended
+ * above the viewport while the reader is at the bottom of a long thread;
+ * Chrome's scroll anchoring hides that shift, WebKit (iOS Safari) does not and
+ * the page visibly "jumps" to older comments. Browsers that already anchored
+ * report a delta of ~0 here, so compensating twice is not a concern.
+ *
+ * Returns false when the anchored row is no longer in the DOM (e.g. the list
+ * switched to the windowed renderer, which only mounts rows near the scroll
+ * offset) so the caller can hand the snapshot over to that renderer.
+ */
+export function restoreThreadScrollAnchor(
+  snapshot: ThreadScrollAnchorSnapshot | null,
+  doc: Document = document,
+  win: Window = window,
+): boolean {
+  if (!snapshot) return false;
+  const element = doc.getElementById(snapshot.anchorId);
+  if (!element) return false;
+
+  const delta = element.getBoundingClientRect().top - snapshot.viewportTop;
+  if (!Number.isFinite(delta) || Math.abs(delta) < 1) return true;
+
+  const target = resolveIssueChatScrollTarget(doc, win);
+  if (target.type === "element") {
+    target.element.scrollTop += delta;
+    return true;
+  }
+  if (!isWindowScrollable(doc, win)) return true;
+  win.scrollBy({ top: delta, left: 0, behavior: "auto" });
+  return true;
+}

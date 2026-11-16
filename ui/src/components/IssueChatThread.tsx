@@ -10,6 +10,7 @@ import type {
 } from "@assistant-ui/react";
 import {
   createContext,
+  createRef,
   Component,
   forwardRef,
   memo,
@@ -134,10 +135,14 @@ import {
 import { restoreSubmittedCommentDraft } from "../lib/comment-submit-draft";
 import {
   captureComposerViewportSnapshot,
+  captureThreadScrollAnchor,
   restoreComposerViewportSnapshot,
+  restoreThreadScrollAnchor,
+  type ThreadScrollAnchorSnapshot,
   shouldPreserveComposerViewport,
 } from "../lib/issue-chat-scroll";
 import { formatAssigneeUserLabel } from "../lib/assignees";
+import { keepThreadScrollAnchored } from "../lib/thread-scroll-anchor";
 import type { CompanyUserProfile } from "../lib/company-members";
 import { timeAgo } from "../lib/timeAgo";
 import {
@@ -3155,6 +3160,9 @@ const VIRTUALIZED_THREAD_GAP_EMBEDDED_PX = 12;
 
 interface VirtualizedIssueChatThreadListProps {
   messages: readonly ThreadMessage[];
+  // Anchor captured by IssueChatThreadScrollKeeper right before the thread
+  // switched from the direct renderer to this windowed one. Consumed on mount.
+  handoffAnchorRef?: React.MutableRefObject<ThreadScrollAnchorSnapshot | null>;
   feedbackVoteByTargetId: ReadonlyMap<string, FeedbackVoteValue>;
   activeRunIds: ReadonlySet<string>;
   stoppingRunId?: string | null;
@@ -3235,8 +3243,19 @@ function useIssueThreadVirtualizer({
   mode: VirtualizedScrollMode;
 }) {
   const measuredSizeByKeyRef = useRef(new Map<React.Key, number>());
+  // Scroll compensation for rows above the viewport that measured larger or
+  // smaller than their estimate. It must not be applied in the commit that
+  // measured the row: the spacer still has its old height there, so a
+  // `scrollBy` past the current scroll range gets clamped (typically while the
+  // reader sits at the bottom of the thread) and the content below shifts
+  // without the viewport following — the thread visibly jumps upwards. The
+  // adjustment is queued and applied by the layout effect of the commit that
+  // rendered the updated sizes.
+  const pendingScrollAdjustmentRef = useRef(0);
+  const sizesVersionRef = useRef(0);
   const [, rerender] = useState(0);
   const estimatedSize = estimateSize();
+  const renderedSizesVersion = sizesVersionRef.current;
 
   const itemStarts: number[] = [];
   const itemSizes: number[] = [];
@@ -3258,6 +3277,19 @@ function useIssueThreadVirtualizer({
       : mode.element.scrollHeight;
     return Math.max(0, Math.max(targetScrollHeight, totalSize) - viewportHeight());
   };
+
+  useLayoutEffect(() => {
+    if (typeof window === "undefined") return;
+    if (renderedSizesVersion !== sizesVersionRef.current) return;
+    const adjustment = pendingScrollAdjustmentRef.current;
+    if (Math.abs(adjustment) < 1) return;
+    pendingScrollAdjustmentRef.current = 0;
+    if (mode.kind === "window") {
+      window.scrollBy({ top: adjustment, behavior: "auto" });
+    } else {
+      mode.element.scrollBy({ top: adjustment, behavior: "auto" });
+    }
+  });
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -3338,12 +3370,9 @@ function useIssueThreadVirtualizer({
         viewportStart: Math.max(scrollMargin, scrollOffset()),
       });
       measuredSizeByKeyRef.current.set(key, measuredSize);
+      sizesVersionRef.current += 1;
       if (Math.abs(scrollAdjustment) >= 1) {
-        if (mode.kind === "window") {
-          window.scrollBy({ top: scrollAdjustment, behavior: "auto" });
-        } else {
-          mode.element.scrollBy({ top: scrollAdjustment, behavior: "auto" });
-        }
+        pendingScrollAdjustmentRef.current += scrollAdjustment;
       }
       rerender((value) => value + 1);
     },
@@ -3367,6 +3396,70 @@ function findScrollContainer(el: HTMLElement | null): HTMLElement | null {
     current = current.parentElement;
   }
   return null;
+}
+
+interface IssueChatThreadScrollKeeperProps {
+  messages: readonly ThreadMessage[];
+  handoffAnchorRef: React.MutableRefObject<ThreadScrollAnchorSnapshot | null>;
+  className?: string;
+  children: ReactNode;
+}
+
+// Keeps the row the reader is looking at in place when the message list
+// changes underneath it. The issue page auto-loads older comment pages and
+// prepends them above the viewport; without compensation the content shifts
+// by the height of the new page (iOS Safari has no scroll anchoring, Chrome
+// loses its anchor when the renderer switches). `getSnapshotBeforeUpdate` is
+// the only React hook that still sees the pre-mutation layout, hence a class.
+class IssueChatThreadScrollKeeper extends Component<IssueChatThreadScrollKeeperProps> {
+  private containerRef = createRef<HTMLDivElement>();
+  private releaseGuard: (() => void) | null = null;
+
+  componentDidMount() {
+    // Late layout shifts between commits (header/description arriving, rows
+    // measuring, images loading) are compensated the same way browsers with
+    // scroll anchoring do it natively.
+    this.releaseGuard = keepThreadScrollAnchored(this.containerRef.current);
+  }
+
+  getSnapshotBeforeUpdate(prevProps: IssueChatThreadScrollKeeperProps): ThreadScrollAnchorSnapshot | null {
+    if (prevProps.messages === this.props.messages || typeof window === "undefined") return null;
+    const anchorIds = new Set<string>();
+    for (const message of prevProps.messages) {
+      const anchorId = issueChatMessageAnchorId(message);
+      if (anchorId) anchorIds.add(anchorId);
+    }
+    const snapshot = captureThreadScrollAnchor(this.containerRef.current, anchorIds);
+    // Expose it before children commit: a freshly mounted windowed list reads
+    // it in its own layout effect, which runs before componentDidUpdate here.
+    this.props.handoffAnchorRef.current = snapshot;
+    return snapshot;
+  }
+
+  componentDidUpdate(
+    _prevProps: IssueChatThreadScrollKeeperProps,
+    _prevState: unknown,
+    snapshot: ThreadScrollAnchorSnapshot | null,
+  ) {
+    if (!snapshot) return;
+    if (this.props.handoffAnchorRef.current !== snapshot) return; // consumed by the windowed list
+    this.props.handoffAnchorRef.current = null;
+    restoreThreadScrollAnchor(snapshot);
+  }
+
+  componentWillUnmount() {
+    this.props.handoffAnchorRef.current = null;
+    this.releaseGuard?.();
+    this.releaseGuard = null;
+  }
+
+  render() {
+    return (
+      <div ref={this.containerRef} className={this.props.className} data-testid="issue-chat-thread-rows">
+        {this.props.children}
+      </div>
+    );
+  }
 }
 
 const VirtualizedIssueChatThreadList = forwardRef<VirtualizedIssueChatThreadListHandle, VirtualizedIssueChatThreadListProps>(function VirtualizedIssueChatThreadList(props, ref) {
@@ -3426,10 +3519,22 @@ const VirtualizedIssueChatThreadListInner = forwardRef<
   variant,
   mode,
   probeRef,
+  handoffAnchorRef,
 }, ref) {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const [scrollMargin, setScrollMargin] = useState(0);
   const pendingPrependAnchorRef = useRef<VirtualizedVisibleAnchorSnapshot | null>(null);
+
+  // Switching renderers unmounts every row; the reader would land wherever the
+  // row estimates happen to put the old scroll offset. Treat the handed-over
+  // anchor like a prepend: scroll its row into the same viewport position.
+  useLayoutEffect(() => {
+    const handoff = handoffAnchorRef?.current ?? null;
+    if (!handoff) return;
+    handoffAnchorRef!.current = null;
+    pendingPrependAnchorRef.current = { anchorId: handoff.anchorId, index: -1, viewportTop: handoff.viewportTop };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const setRefs = useCallback((element: HTMLDivElement | null) => {
     parentRef.current = element;
@@ -4423,6 +4528,7 @@ export function IssueChatThread({
   const lastScrolledHashRef = useRef<string | null>(null);
   const didInitialHashScrollDecisionRef = useRef(false);
   const virtualizedThreadRef = useRef<VirtualizedIssueChatThreadListHandle | null>(null);
+  const scrollAnchorHandoffRef = useRef<ThreadScrollAnchorSnapshot | null>(null);
   const bottomAnchorRef = useRef<HTMLDivElement | null>(null);
   const composerViewportAnchorRef = useRef<HTMLDivElement | null>(null);
   const composerViewportSnapshotRef = useRef<ReturnType<typeof captureComposerViewportSnapshot>>(null);
@@ -5068,31 +5174,40 @@ export function IssueChatThread({
                 )}>
                   {resolvedEmptyMessage}
                 </Card>
-              ) : messages.length >= VIRTUALIZED_THREAD_ROW_THRESHOLD ? (
-                <VirtualizedIssueChatThreadList
-                  ref={virtualizedThreadRef}
-                  messages={messages}
-                  feedbackVoteByTargetId={feedbackVoteByTargetId}
-                  activeRunIds={activeRunIds}
-                  stoppingRunId={stoppingRunId}
-                  interruptingQueuedRunId={interruptingQueuedRunId}
-                  variant={variant}
-                />
               ) : (
-                // Keep transcript rendering independent from assistant-ui's
-                // index-scoped message providers; live transcripts can shrink
-                // or regroup while the runtime still holds stale indices.
-                messages.map((message) => (
-                  <IssueChatMessageRow
-                    key={message.id}
-                    message={message}
-                    feedbackVoteByTargetId={feedbackVoteByTargetId}
-                    activeRunIds={activeRunIds}
-                    stoppingRunId={stoppingRunId}
-                    interruptingQueuedRunId={interruptingQueuedRunId}
-                  />
-              ))
-            )}
+                <IssueChatThreadScrollKeeper
+                  messages={messages}
+                  handoffAnchorRef={scrollAnchorHandoffRef}
+                  className={variant === "embedded" ? "space-y-3" : "space-y-4"}
+                >
+                  {messages.length >= VIRTUALIZED_THREAD_ROW_THRESHOLD ? (
+                    <VirtualizedIssueChatThreadList
+                      ref={virtualizedThreadRef}
+                      messages={messages}
+                      handoffAnchorRef={scrollAnchorHandoffRef}
+                      feedbackVoteByTargetId={feedbackVoteByTargetId}
+                      activeRunIds={activeRunIds}
+                      stoppingRunId={stoppingRunId}
+                      interruptingQueuedRunId={interruptingQueuedRunId}
+                      variant={variant}
+                    />
+                  ) : (
+                    // Keep transcript rendering independent from assistant-ui's
+                    // index-scoped message providers; live transcripts can shrink
+                    // or regroup while the runtime still holds stale indices.
+                    messages.map((message) => (
+                      <IssueChatMessageRow
+                        key={message.id}
+                        message={message}
+                        feedbackVoteByTargetId={feedbackVoteByTargetId}
+                        activeRunIds={activeRunIds}
+                        stoppingRunId={stoppingRunId}
+                        interruptingQueuedRunId={interruptingQueuedRunId}
+                      />
+                    ))
+                  )}
+                </IssueChatThreadScrollKeeper>
+              )}
               {showComposer ? (
                 <div data-testid="issue-chat-thread-notices" className="space-y-2">
                   <IssueAssignedBacklogNotice
